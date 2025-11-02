@@ -189,7 +189,7 @@ def prepare_datasets(
     return tuple(random_split(dataset, lengths, generator=torch.Generator().manual_seed(config.seed)))  # type: ignore[return-value]
 
 
-def train_model(
+def train_model_core(
     dataset: PhaseDataset,
     config: TrainingConfig,
     validation_dataset: Optional[PhaseDataset] = None,
@@ -209,6 +209,17 @@ def train_model(
     optimizer = Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 
     history: List[Dict[str, float]] = []
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        verbose=False,
+    )
+    best_val = float("inf")
+    best_state = None
+    patience = 7
+    bad_epochs = 0
     for epoch in range(config.epochs):
         model.train()
         total_loss = 0.0
@@ -227,8 +238,22 @@ def train_model(
         metrics = {"epoch": epoch + 1, "train_loss": avg_loss}
         if val_loader is not None:
             metrics.update(evaluate_model(model, val_loader, device))
+            # Scheduler and early stopping on validation loss
+            scheduler.step(metrics["val_loss"])  # type: ignore[arg-type]
+            if metrics["val_loss"] < best_val:
+                best_val = metrics["val_loss"]
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
         history.append(metrics)
         LOGGER.info("Epoch %d | Train Loss: %.4f | Val Loss: %.4f", metrics["epoch"], metrics["train_loss"], metrics.get("val_loss", float("nan")))
+        if val_loader is not None and bad_epochs >= patience:
+            LOGGER.info("Early stopping triggered at epoch %d", metrics["epoch"]) 
+            break
+    # Restore best weights if available
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return model, history
 
 
@@ -271,3 +296,137 @@ def load_model(path: Path, input_dim: int) -> nn.Module:
     model.load_state_dict(torch.load(path, map_location="cpu"))
     model.eval()
     return model
+
+
+def _infer_target_vectors(df: np.ndarray | None, hours: Optional[np.ndarray], radians: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    raise NotImplementedError  # placeholder (not used)
+
+
+def _build_sequences_from_df(
+    df: "np.ndarray",
+    feature_cols: List[str],
+    target_vecs: np.ndarray,
+    user_ids: np.ndarray,
+    seq_len: int,
+    step: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create sliding window sequences per user without crossing boundaries."""
+
+    X_list: List[np.ndarray] = []
+    y_list: List[np.ndarray] = []
+    start = 0
+    # Assumes df is a structured array-like aligned with user_ids
+    for uid in np.unique(user_ids):
+        idx = np.where(user_ids == uid)[0]
+        if idx.size == 0:
+            continue
+        uX = df[idx][:, [feature_cols.index(c) for c in feature_cols]] if isinstance(df, np.ndarray) else df.loc[idx, feature_cols].values
+        uy = target_vecs[idx]
+        for i in range(0, len(idx) - seq_len + 1, step):
+            X_list.append(uX[i : i + seq_len])
+            y_list.append(uy[i + seq_len - 1])
+    return np.stack(X_list), np.stack(y_list)
+
+
+def train_model(
+    features_csv: str | Path,
+    save_path: str | Path = "model/circadian_phase_estimator.pt",
+    seq_len: int = 240,
+    step: int = 5,
+    config: Optional[TrainingConfig] = None,
+) -> Dict[str, Any]:
+    """Train from a features CSV and save the model.
+
+    Expects features CSV to include:
+    - user_id
+    - datetime
+    - numerical feature columns
+    - one of: phase_rad, phase_hours, or solar_phase_offset (fallback proxy)
+    """
+    import pandas as pd
+
+    config = config or TrainingConfig()
+    df = pd.read_csv(features_csv, parse_dates=["datetime"])  # type: ignore[arg-type]
+    df = df.sort_values(["user_id", "datetime"]).reset_index(drop=True)
+
+    # Determine target
+    if "phase_rad" in df.columns:
+        radians = df["phase_rad"].to_numpy()
+    elif "phase_hours" in df.columns:
+        radians = (df["phase_hours"].to_numpy() % 24.0) / 24.0 * 2 * math.pi
+    elif "solar_phase_offset" in df.columns:
+        # Proxy: map [-12, 12) offset to [0, 24)
+        hours = ((df["solar_phase_offset"].to_numpy() + 12.0) % 24.0)
+        radians = hours / 24.0 * 2 * math.pi
+        LOGGER.warning("Using solar_phase_offset as a proxy target; please provide ground-truth phase if available.")
+    else:
+        raise KeyError("No target column found. Provide 'phase_rad' or 'phase_hours' (or 'solar_phase_offset' as proxy).")
+
+    target_vecs = np.stack([np.sin(radians), np.cos(radians)], axis=1)
+
+    # Feature columns: numeric excluding obvious non-features
+    non_feats = {"user_id", "datetime", "phase_rad", "phase_hours", "solar_phase_offset"}
+    feature_cols = [c for c in df.columns if c not in non_feats and np.issubdtype(df[c].dtype, np.number)]
+    X_array = df[feature_cols].values.astype(np.float32)
+    users = df["user_id"].to_numpy()
+
+    # Build sequences per user
+    sequences: List[np.ndarray] = []
+    targets: List[np.ndarray] = []
+    for uid, g in df.groupby("user_id", sort=False):
+        gX = g[feature_cols].values.astype(np.float32)
+        gy = target_vecs[g.index]
+        for i in range(0, len(g) - seq_len + 1, step):
+            sequences.append(gX[i : i + seq_len])
+            targets.append(gy[i + seq_len - 1])
+    sequences_np = np.stack(sequences)
+    targets_np = np.stack(targets)
+
+    # Split datasets
+    train_ds, val_ds, test_ds = prepare_datasets(sequences_np, targets_np, config)
+
+    # Train with early stopping & scheduler
+    model, history = train_model_core(train_ds, config, validation_dataset=val_ds)
+
+    # Evaluate on test
+    device = torch.device(config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    test_loader = DataLoader(test_ds, batch_size=config.batch_size)
+    # Collect predictions for plotting
+    model.eval()
+    preds: List[Any] = []
+    trues: List[Any] = []
+    total_loss = 0.0
+    with torch.no_grad():
+        for bx, by in test_loader:
+            bx = bx.to(device)
+            by = by.to(device)
+            out = model(bx)
+            loss = circular_mae(out, by)
+            total_loss += loss.item() * bx.size(0)
+            preds.append(out.cpu())
+            trues.append(by.cpu())
+    pred_np = torch.cat(preds).numpy()
+    true_np = torch.cat(trues).numpy()
+    test_metrics = compute_metrics(pred_np, true_np)
+    test_metrics["val_loss"] = total_loss / len(test_loader.dataset)
+
+    # Convert to hours for viz
+    pred_angles = np.arctan2(pred_np[:, 0], pred_np[:, 1])
+    true_angles = np.arctan2(true_np[:, 0], true_np[:, 1])
+    pred_hours = (pred_angles % (2 * math.pi)) / (2 * math.pi) * 24.0
+    true_hours = (true_angles % (2 * math.pi)) / (2 * math.pi) * 24.0
+
+    # Save model
+    save_path = Path(save_path)
+    save_model(model, save_path)
+
+    return {
+        "feature_cols": feature_cols,
+        "history": history,
+        "test_metrics": test_metrics,
+        "model_path": str(save_path),
+        "input_dim": len(feature_cols),
+        "seq_len": seq_len,
+        "test_pred_hours": pred_hours.tolist(),
+        "test_true_hours": true_hours.tolist(),
+    }

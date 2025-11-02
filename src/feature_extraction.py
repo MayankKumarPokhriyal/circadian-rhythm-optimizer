@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
 from sklearn.preprocessing import StandardScaler
+
+from .utils.file_helpers import ensure_dir, write_csv_safe
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +46,29 @@ class FeatureSet:
     features: pd.DataFrame
     targets: Optional[pd.DataFrame] = None
     scaler: Optional[StandardScaler] = None
+
+
+def compute_hrv(rr_series: pd.Series) -> Dict[str, float]:
+    """Compute time-domain HRV metrics: RMSSD and SDNN.
+
+    Parameters
+    ----------
+    rr_series : pd.Series
+        RR intervals in milliseconds.
+
+    Returns
+    -------
+    Dict[str, float]
+        Keys: rmssd, sdnn
+    """
+
+    s = pd.to_numeric(rr_series, errors="coerce").dropna()
+    if len(s) < 2:
+        return {"rmssd": float("nan"), "sdnn": float("nan")}
+    diffs = s.diff().dropna()
+    rmssd = float(np.sqrt(np.mean(diffs.values ** 2)))
+    sdnn = float(np.std(s.values, ddof=1))
+    return {"rmssd": rmssd, "sdnn": sdnn}
 
 
 def compute_time_derived_features(df: pd.DataFrame, datetime_col: str = "datetime") -> pd.DataFrame:
@@ -217,3 +243,111 @@ def attach_targets(
     enriched["phase_sin"] = np.sin(radians)
     enriched["phase_cos"] = np.cos(radians)
     return enriched
+
+
+def extract_circadian_features(
+    all_users_path: str | Path,
+    output_path: str | Path = "data/features/circadian_features.csv",
+    log: bool = True,
+) -> Path:
+    """Generate ML-ready circadian features per user and persist to CSV.
+
+    Steps per user_id:
+    - Rolling stats over 30 min to 6 h for heart rate and activity VM
+    - Time-domain HRV metrics from RR intervals (if present)
+    - Sleep quality proxies from is_sleep flag (TST, WASO, efficiency via rolling)
+    - Merge daily static values from questionnaire/saliva
+    - Per-user z-score normalization of numeric columns
+    """
+
+    all_users_path = Path(all_users_path)
+    output_path = Path(output_path)
+    ensure_dir(output_path.parent)
+
+    df = pd.read_csv(all_users_path, parse_dates=["datetime"])
+    if "user_id" not in df.columns:
+        raise KeyError("Expected 'user_id' column in merged dataset.")
+
+    # Pre-compute activity VM if possible
+    axes = [c for c in df.columns if c.startswith("acc_")]
+    if axes:
+        df["acc_vm"] = np.sqrt((df[axes] ** 2).sum(axis=1))
+
+    # Prepare containers
+    frames: List[pd.DataFrame] = []
+    for uid, g in df.groupby("user_id", sort=False):
+        g = g.sort_values("datetime").copy()
+        g.set_index("datetime", inplace=True)
+
+        # Rolling windows
+        windows = {"30min": "30min", "1h": "60min", "2h": "120min", "6h": "360min"}
+
+        # Heart rate metrics
+        if "heart_rate" in g.columns:
+            for name, rule in windows.items():
+                g[f"hr_mean_{name}"] = g["heart_rate"].rolling(rule, min_periods=5).mean()
+                g[f"hr_var_{name}"] = g["heart_rate"].rolling(rule, min_periods=5).var()
+
+        # RR intervals (time-domain HRV)
+        rr_col = None
+        for c in g.columns:
+            cl = c.lower()
+            if "rr" in cl and "ms" in cl:
+                rr_col = c
+                break
+        if rr_col:
+            # Compute HRV in rolling windows using apply with stride windows
+            for name, rule in windows.items():
+                g[f"rmssd_{name}"] = g[rr_col].rolling(rule, min_periods=10).apply(
+                    lambda s: compute_hrv(pd.Series(s)).get("rmssd", np.nan), raw=False
+                )
+                g[f"sdnn_{name}"] = g[rr_col].rolling(rule, min_periods=10).apply(
+                    lambda s: compute_hrv(pd.Series(s)).get("sdnn", np.nan), raw=False
+                )
+
+        # Activity features
+        if "acc_vm" in g.columns:
+            for name, rule in windows.items():
+                g[f"vm_mean_{name}"] = g["acc_vm"].rolling(rule, min_periods=5).mean()
+                g[f"vm_std_{name}"] = g["acc_vm"].rolling(rule, min_periods=5).std()
+
+        # Sleep features (if is_sleep present): TST, WASO, efficiency via rolling 6h
+        if "is_sleep" in g.columns:
+            asleep = g["is_sleep"].astype(float)
+            # Total Sleep Time proportion in window
+            g["tst_prop_6h"] = asleep.rolling("360min", min_periods=5).mean()
+            # Sleep transitions as proxy for fragmentation / WASO
+            transitions = asleep.diff().abs().fillna(0.0)
+            g["waso_events_6h"] = transitions.rolling("360min", min_periods=5).sum()
+            # Efficiency proxy: sleep fraction variability
+            g["sleep_eff_var_6h"] = (
+                asleep.rolling("360min", min_periods=5).var()
+            )
+
+        # Static questionnaire/saliva: forward fill per day
+        static_cols = [c for c in g.columns if c.startswith("questionnaire_") or c.startswith("melatonin") or c.startswith("cortisol") or c.startswith("user_")]
+        if static_cols:
+            g[static_cols] = g[static_cols].ffill()
+
+        # Per-user normalization (z-score) on numeric columns
+        g.reset_index(inplace=True)
+        numeric_cols = g.select_dtypes(include=["number"]).columns
+        # Do not normalize binary flags
+        skip_cols = {"is_sleep"}
+        norm_cols = [c for c in numeric_cols if c not in skip_cols]
+        g[norm_cols] = (g[norm_cols] - g[norm_cols].mean()) / g[norm_cols].std(ddof=0)
+
+        # Log missing ratio and feature count
+        if log:
+            missing_ratio = float(g.isna().mean().mean())
+            LOGGER.info(
+                "User %s | features=%d | missing_ratio=%.3f",
+                uid,
+                g.shape[1],
+                missing_ratio,
+            )
+        frames.append(g)
+
+    features = pd.concat(frames, axis=0, ignore_index=True)
+    write_csv_safe(features, output_path)
+    return output_path

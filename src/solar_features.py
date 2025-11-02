@@ -137,3 +137,58 @@ def solar_phase_reference(events: pd.DataFrame) -> Dict[pd.Timestamp, float]:
             continue
         reference[pd.Timestamp(row["date"]).normalize()] = 0.0  # solar midnight as phase 0
     return reference
+
+
+def add_solar_context(
+    df: pd.DataFrame,
+    lat: float,
+    lon: float,
+    elevation: float = 0.0,
+    timezone: Optional[str] = "Europe/Rome",
+) -> pd.DataFrame:
+    """Append solar context using pvlib: daylight minutes and solar phase offset.
+
+    - daylight_minutes: minutes of daylight on the row's calendar day
+    - solar_phase_offset: hours relative to solar noon (transit), wrapped to [-12, 12)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain a 'datetime' column.
+    lat, lon : float
+        Observer coordinates.
+    elevation : float
+        Site elevation in meters.
+    timezone : Optional[str]
+        Olson timezone string. Defaults to Europe/Rome.
+    """
+    if "datetime" not in df.columns:
+        raise KeyError("'datetime' column is required to add solar context")
+
+    out = df.copy()
+    # Ensure timezone-aware UTC
+    ts = pd.to_datetime(out["datetime"], utc=True)
+
+    context = SolarContext(latitude=lat, longitude=lon, elevation=elevation, timezone=timezone)
+    # Compute per-day events over all unique days present
+    # Convert to the target timezone for the dates used by pvlib
+    local_days = ts.tz_convert(timezone).floor("D") if ts.dt.tz is not None else ts.tz_localize("UTC").tz_convert(timezone).floor("D")
+    unique_dates = pd.DatetimeIndex(sorted(local_days.unique()))
+    events = compute_solar_events(context, dates=unique_dates.to_pydatetime())
+
+    # Prepare mapping by local day (normalized midnight in timezone)
+    events["local_day"] = pd.to_datetime(events["date"]).dt.tz_convert(timezone).floor("D")
+    events["daylight_minutes"] = events["day_length_hours"] * 60.0
+    ev_map = events.set_index("local_day")[
+        ["sunrise", "sunset", "solar_noon", "solar_midnight", "daylight_minutes"]
+    ]
+
+    # Align each row's day to events
+    row_local_day = (ts.tz_convert(timezone) if ts.dt.tz is not None else ts.tz_localize("UTC").tz_convert(timezone)).floor("D")
+    out = out.join(ev_map, on=row_local_day, how="left")
+
+    # Compute solar phase offset relative to solar noon (in hours), wrapped to [-12, 12)
+    delta_hours = (ts - out["solar_noon"].dt.tz_convert("UTC")).dt.total_seconds() / 3600.0
+    out["solar_phase_offset"] = ((delta_hours + 12.0) % 24.0) - 12.0
+
+    return out
